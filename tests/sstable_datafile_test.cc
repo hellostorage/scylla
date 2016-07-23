@@ -41,6 +41,7 @@
 #include "range.hh"
 #include "partition_slice_builder.hh"
 #include "sstables/date_tiered_compaction_strategy.hh"
+#include "mutation_assertions.hh"
 
 #include <stdio.h>
 #include <ftw.h>
@@ -2596,43 +2597,25 @@ SEASTAR_TEST_CASE(test_wrong_range_tombstone_order) {
 
         auto smopt = reader().get0();
         BOOST_REQUIRE(smopt);
-        auto& sm = *smopt;
         
         using kind = mutation_fragment::kind;
-        auto then_expect = [&] (kind k, std::vector<int> ck_elems) {
-            std::vector<bytes> ck_bytes;
-            for (auto&& e : ck_elems) {
-                ck_bytes.emplace_back(int32_type->decompose(e));
-            }
-            auto ck = clustering_key_prefix::from_exploded(*s, std::move(ck_bytes));
-
-            auto mfopt = sm().get0();
-            BOOST_REQUIRE(mfopt);
-            if (mfopt->mutation_fragment_kind() != k) {
-                abort();
-            }
-            BOOST_REQUIRE(mfopt->mutation_fragment_kind() == k);
-            BOOST_REQUIRE(ck_eq(mfopt->key(), ck));
-        };
-
-        then_expect(kind::range_tombstone, { 0 });
-        then_expect(kind::clustering_row, { 1 });
-        then_expect(kind::clustering_row, { 1, 1 });
-        then_expect(kind::clustering_row, { 1, 2 });
-        then_expect(kind::clustering_row, { 1, 2, 3 });
-        then_expect(kind::range_tombstone, { 1, 3 });
-        then_expect(kind::clustering_row, { 1, 3 });
-        then_expect(kind::clustering_row, { 1, 3, 4 });
-        then_expect(kind::clustering_row, { 1, 4 });
-        then_expect(kind::clustering_row, { 1, 4, 0 });
-        then_expect(kind::range_tombstone, { 2 });
-        then_expect(kind::range_tombstone, { 2, 1 });
-        then_expect(kind::range_tombstone, { 2, 1 });
-        then_expect(kind::range_tombstone, { 2, 2 });
-        then_expect(kind::range_tombstone, { 2, 2 });
-
-        auto mfopt = sm().get0();
-        BOOST_REQUIRE(!mfopt);
+        assert_that_stream(std::move(*smopt))
+            .produces(kind::range_tombstone, { 0 })
+            .produces(kind::clustering_row, { 1 })
+            .produces(kind::clustering_row, { 1, 1 })
+            .produces(kind::clustering_row, { 1, 2 })
+            .produces(kind::clustering_row, { 1, 2, 3 })
+            .produces(kind::range_tombstone, { 1, 3 })
+            .produces(kind::clustering_row, { 1, 3 })
+            .produces(kind::clustering_row, { 1, 3, 4 })
+            .produces(kind::clustering_row, { 1, 4 })
+            .produces(kind::clustering_row, { 1, 4, 0 })
+            .produces(kind::range_tombstone, { 2 })
+            .produces(kind::range_tombstone, { 2, 1 })
+            .produces(kind::range_tombstone, { 2, 1 })
+            .produces(kind::range_tombstone, { 2, 2 })
+            .produces(kind::range_tombstone, { 2, 2 })
+            .produces_end_of_stream();
 
         smopt = reader().get0();
         BOOST_REQUIRE(!smopt);
@@ -2766,13 +2749,12 @@ SEASTAR_TEST_CASE(basic_date_tiered_strategy_test) {
     int min_threshold = cf->schema()->min_compaction_threshold();
     auto now = db_clock::now();
     auto past_hour = now - std::chrono::seconds(3600);
+    int64_t timestamp_for_now = now.time_since_epoch().count() * 1000;
     int64_t timestamp_for_past_hour = past_hour.time_since_epoch().count() * 1000;
 
     for (auto i = 1; i <= min_threshold; i++) {
-        auto tp = now + std::chrono::seconds(i);
-        int64_t timestamp_for_this_sst = tp.time_since_epoch().count() * 1000;
         auto sst = add_sstable_for_overlapping_test(cf, /*gen*/i, "a", "a",
-            build_stats(timestamp_for_this_sst, timestamp_for_this_sst, std::numeric_limits<int32_t>::max()));
+            build_stats(timestamp_for_now, timestamp_for_now, std::numeric_limits<int32_t>::max()));
         candidates.push_back(sst);
     }
     // add sstable that belong to a different time tier.
@@ -2790,4 +2772,109 @@ SEASTAR_TEST_CASE(basic_date_tiered_strategy_test) {
     }
 
     return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(date_tiered_strategy_test_2) {
+    auto s = make_lw_shared(schema({}, some_keyspace, some_column_family,
+        {{"p1", utf8_type}}, {}, {}, {}, utf8_type));
+    compaction_manager cm;
+    column_family::config cfg;
+    auto cf = make_lw_shared<column_family>(s, cfg, column_family::no_commitlog(), cm);
+
+    // deterministic timestamp for Fri, 01 Jan 2016 00:00:00 GMT.
+    auto tp = db_clock::from_time_t(1451606400);
+    int64_t timestamp = tp.time_since_epoch().count() * 1000; // in microseconds.
+
+    std::vector<sstables::shared_sstable> candidates;
+    int min_threshold = cf->schema()->min_compaction_threshold();
+
+    // add sstables that belong to same time window until min threshold is satisfied.
+    for (auto i = 1; i <= min_threshold; i++) {
+        auto sst = add_sstable_for_overlapping_test(cf, /*gen*/i, "a", "a",
+            build_stats(timestamp, timestamp, std::numeric_limits<int32_t>::max()));
+        candidates.push_back(sst);
+    }
+    // belongs to the time window
+    auto tp2 = tp + std::chrono::seconds(1800);
+    timestamp = tp2.time_since_epoch().count() * 1000;
+    auto sst = add_sstable_for_overlapping_test(cf, /*gen*/min_threshold + 1, "a", "a",
+        build_stats(timestamp, timestamp, std::numeric_limits<int32_t>::max()));
+    candidates.push_back(sst);
+
+    // doesn't belong to the time window above
+    auto tp3 = tp + std::chrono::seconds(4000);
+    timestamp = tp3.time_since_epoch().count() * 1000;
+    auto sst2 = add_sstable_for_overlapping_test(cf, /*gen*/min_threshold + 2, "a", "a",
+        build_stats(timestamp, timestamp, std::numeric_limits<int32_t>::max()));
+    candidates.push_back(sst2);
+
+    std::map<sstring, sstring> options;
+    // Use a 1-hour time window.
+    options.emplace(sstring("base_time_seconds"), sstring("3600"));
+
+    date_tiered_manifest manifest(options);
+    auto gc_before = gc_clock::time_point(std::chrono::seconds(0)); // disable gc before.
+    auto sstables = manifest.get_next_sstables(*cf, candidates, gc_before);
+    std::unordered_set<int64_t> gens;
+    for (auto sst : sstables) {
+        gens.insert(sst->generation());
+    }
+    BOOST_REQUIRE(sstables.size() == size_t(min_threshold + 1));
+    BOOST_REQUIRE(gens.count(min_threshold + 1));
+    BOOST_REQUIRE(!gens.count(min_threshold + 2));
+
+    return make_ready_future<>();
+}
+
+SEASTAR_TEST_CASE(test_promoted_index_read) {
+    // create table promoted_index_read (
+    //        pk int,
+    //        ck1 int,
+    //        ck2 int,
+    //        v int,
+    //        primary key (pk, ck1, ck2)
+    // );
+    //
+    // column_index_size_in_kb: 0
+    //
+    // delete from promoted_index_read where pk = 0 and ck1 = 0;
+    // insert into promoted_index_read (pk, ck1, ck2, v) values (0, 0, 0, 0);
+    // insert into promoted_index_read (pk, ck1, ck2, v) values (0, 0, 1, 1);
+    //
+    // SSTable:
+    // [
+    // {"key": "0",
+    //  "cells": [["0:_","0:!",1468923292708929,"t",1468923292],
+    //            ["0:_","0:!",1468923292708929,"t",1468923292],
+    //            ["0:0:","",1468923308379491],
+    //            ["0:_","0:!",1468923292708929,"t",1468923292],
+    //            ["0:0:v","0",1468923308379491],
+    //            ["0:_","0:!",1468923292708929,"t",1468923292],
+    //            ["0:1:","",1468923311744298],
+    //            ["0:_","0:!",1468923292708929,"t",1468923292],
+    //            ["0:1:v","1",1468923311744298]]}
+    // ]
+
+    return seastar::async([] {
+        auto s = schema_builder("ks", "promoted_index_read")
+                .with_column("pk", int32_type, column_kind::partition_key)
+                .with_column("ck1", int32_type, column_kind::clustering_key)
+                .with_column("ck2", int32_type, column_kind::clustering_key)
+                .with_column("v", int32_type)
+                .build();
+
+        auto sst = make_lw_shared<sstable>("ks", "promoted_index_read", "tests/sstables/promoted_index_read", 1, sstables::sstable::version_types::ka, big);
+        sst->load().get0();
+
+        auto rd = sstable_reader(sst, s);
+        auto smopt = rd().get0();
+        BOOST_REQUIRE(smopt);
+
+        using kind = mutation_fragment::kind;
+        assert_that_stream(std::move(*smopt))
+                .produces(kind::range_tombstone, { 0 })
+                .produces(kind::clustering_row, { 0, 0 })
+                .produces(kind::clustering_row, { 0, 1 })
+                .produces_end_of_stream();
+    });
 }

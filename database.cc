@@ -127,7 +127,7 @@ column_family::column_family(schema_ptr schema, config config, db::commitlog* cl
     , _streaming_memtables(_config.enable_disk_writes ? make_streaming_memtable_list() : make_memory_only_memtable_list())
     , _compaction_strategy(make_compaction_strategy(_schema->compaction_strategy(), _schema->compaction_strategy_options()))
     , _sstables(make_lw_shared(_compaction_strategy.make_sstable_set(_schema)))
-    , _cache(_schema, sstables_as_mutation_source(), sstables_as_key_source(), global_cache_tracker())
+    , _cache(_schema, sstables_as_mutation_source(), sstables_as_key_source(), global_cache_tracker(), _config.max_cached_partition_size_in_bytes)
     , _commitlog(cl)
     , _compaction_manager(compaction_manager)
     , _flush_queue(std::make_unique<memtable_flush_queue>())
@@ -785,7 +785,7 @@ future<> column_family::seal_active_streaming_memtable_big(streaming_memtable_bi
 future<>
 column_family::seal_active_memtable(memtable_list::flush_behavior ignored) {
     auto old = _memtables->back();
-    dblog.debug("Sealing active memtable, partitions: {}, occupancy: {}", old->partition_count(), old->occupancy());
+    dblog.debug("Sealing active memtable of {}.{}, partitions: {}, occupancy: {}", _schema->cf_name(), _schema->ks_name(), old->partition_count(), old->occupancy());
 
     if (old->empty()) {
         dblog.debug("Memtable is empty");
@@ -1217,6 +1217,10 @@ lw_shared_ptr<sstable_list> column_family::get_sstables() const {
     return _sstables->all();
 }
 
+std::vector<sstables::shared_sstable> column_family::select_sstables(const query::partition_range& range) const {
+    return _sstables->select(range);
+}
+
 // Gets the list of all sstables in the column family, including ones that are
 // not used for active queries because they have already been compacted, but are
 // waiting for delete_atomically() to return.
@@ -1577,7 +1581,7 @@ future<> database::parse_system_tables(distributed<service::storage_proxy>& prox
                 return parallel_for_each(tables.begin(), tables.end(), [this] (auto& t) {
                     auto s = t.second;
                     auto& ks = this->find_keyspace(s->ks_name());
-                    auto cfg = ks.make_column_family_config(*s);
+                    auto cfg = ks.make_column_family_config(*s, this->get_config());
                     this->add_column_family(s, std::move(cfg));
                     return ks.make_directory_for_column_family(s->cf_name(), s->id()).then([s] {});
                 });
@@ -1756,6 +1760,15 @@ std::vector<sstring>  database::get_non_system_keyspaces() const {
     return res;
 }
 
+std::vector<lw_shared_ptr<column_family>> database::get_non_system_column_families() const {
+    return boost::copy_range<std::vector<lw_shared_ptr<column_family>>>(
+        get_column_families()
+            | boost::adaptors::map_values
+            | boost::adaptors::filtered([](const lw_shared_ptr<column_family>& cf) {
+                return cf->schema()->ks_name() != db::system_keyspace::NAME;
+            }));
+}
+
 column_family& database::find_column_family(const sstring& ks_name, const sstring& cf_name) {
     try {
         return find_column_family(find_uuid(ks_name, cf_name));
@@ -1825,7 +1838,7 @@ void keyspace::update_from(::lw_shared_ptr<keyspace_metadata> ksm) {
 }
 
 column_family::config
-keyspace::make_column_family_config(const schema& s) const {
+keyspace::make_column_family_config(const schema& s, const db::config& db_config) const {
     column_family::config cfg;
     cfg.datadir = column_family_directory(s.cf_name(), s.id());
     cfg.enable_disk_reads = _config.enable_disk_reads;
@@ -1839,6 +1852,7 @@ keyspace::make_column_family_config(const schema& s) const {
     cfg.read_concurrency_config = _config.read_concurrency_config;
     cfg.cf_stats = _config.cf_stats;
     cfg.enable_incremental_backups = _config.enable_incremental_backups;
+    cfg.max_cached_partition_size_in_bytes = db_config.max_cached_partition_size_in_kb() * 1024;
 
     return cfg;
 }
@@ -2489,6 +2503,7 @@ future<> update_schema_version_and_announce(distributed<service::storage_proxy>&
             return make_ready_future<>();
         }).then([uuid] {
             return db::system_keyspace::update_schema_version(uuid).then([uuid] {
+                dblog.info("Schema version changed to {}", uuid);
                 return service::get_local_migration_manager().passive_announce(uuid);
             });
         });
